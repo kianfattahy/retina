@@ -14,6 +14,9 @@ use std::{fs::File, io::Write, str::FromStr, sync::Arc};
 use structopt::StructOpt;
 
 /// Decodes H.264 streams using ffmpeg, writing them into `frame<i>.ppm` images.
+///
+/// TODO: this only appears to generate proper images with
+/// `--convert-to-annex-b`. Unsure why the default AVC isn't working.
 #[derive(StructOpt)]
 struct Opts {
     /// `rtsp://` URL to connect to.
@@ -35,6 +38,9 @@ struct Opts {
     /// The transport to use: `tcp` or `udp` (experimental).
     #[structopt(default_value, long)]
     transport: retina::client::Transport,
+
+    #[structopt(long)]
+    convert_to_annex_b: bool,
 }
 
 fn init_logging() -> mylog::Handle {
@@ -67,12 +73,15 @@ struct H264Processor {
     decoder: ffmpeg::codec::decoder::Video,
     scaler: Option<ffmpeg::software::scaling::Context>,
     frame_i: u64,
+    convert_to_annex_b: bool,
 }
 
 impl H264Processor {
-    fn new() -> Self {
+    fn new(convert_to_annex_b: bool) -> Self {
         let mut codec_opts = ffmpeg::Dictionary::new();
-        codec_opts.set("is_avc", "1");
+        if !convert_to_annex_b {
+            codec_opts.set("is_avc", "1");
+        }
         let codec = ffmpeg::codec::decoder::find(ffmpeg::codec::Id::H264).unwrap();
         let decoder = ffmpeg::codec::decoder::Decoder(ffmpeg::codec::Context::new())
             .open_as_with(codec, codec_opts)
@@ -83,12 +92,18 @@ impl H264Processor {
             decoder,
             scaler: None,
             frame_i: 0,
+            convert_to_annex_b,
         }
     }
 
     fn handle_parameters(&mut self, p: &VideoParameters) -> Result<(), Error> {
-        let pkt = ffmpeg::codec::packet::Packet::borrow(p.extra_data());
-        self.decoder.send_packet(&pkt)?;
+        if !self.convert_to_annex_b {
+            let pkt = ffmpeg::codec::packet::Packet::borrow(p.extra_data());
+            self.decoder.send_packet(&pkt)?;
+        } else {
+            // TODO: should convert and supply SPS/PPS, rather than relying on
+            // them existing in-band within frames.
+        }
 
         // ffmpeg doesn't appear to actually handle the parameters until the
         // first full frame, so just note that the scaler needs to be
@@ -97,8 +112,12 @@ impl H264Processor {
         Ok(())
     }
 
-    fn send_frame(&mut self, f: &VideoFrame) -> Result<(), Error> {
-        let pkt = ffmpeg::codec::packet::Packet::borrow(f.data());
+    fn send_frame(&mut self, f: VideoFrame) -> Result<(), Error> {
+        let mut data = f.into_data();
+        if self.convert_to_annex_b {
+            convert_h264(&mut data)?;
+        }
+        let pkt = ffmpeg::codec::packet::Packet::borrow(&data);
         self.decoder.send_packet(&pkt)?;
         self.receive_frames()?;
         Ok(())
@@ -158,6 +177,27 @@ impl H264Processor {
     }
 }
 
+/// Converts from AVC representation to the Annex B representation.
+fn convert_h264(data: &mut [u8]) -> Result<(), Error> {
+    let mut i = 0;
+    while i < data.len() - 3 {
+        // Replace each NAL's length with the Annex B start code b"\x00\x00\x00\x01".
+        let len = u32::from_be_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]) as usize;
+        data[i] = 0;
+        data[i + 1] = 0;
+        data[i + 2] = 0;
+        data[i + 3] = 1;
+        i += 4 + len;
+        if i > data.len() {
+            bail!("partial NAL body");
+        }
+    }
+    if i < data.len() {
+        bail!("partial NAL length");
+    }
+    Ok(())
+}
+
 async fn run() -> Result<(), Error> {
     let opts = Opts::from_args();
     ffmpeg::init().unwrap();
@@ -200,7 +240,7 @@ async fn run() -> Result<(), Error> {
             false
         })
         .ok_or_else(|| anyhow!("No h264 video stream found"))?;
-    let mut processor = H264Processor::new();
+    let mut processor = H264Processor::new(opts.convert_to_annex_b);
     session
         .setup(
             video_stream_i,
@@ -229,7 +269,7 @@ async fn run() -> Result<(), Error> {
                             };
                             processor.handle_parameters(v)?;
                         }
-                        processor.send_frame(&f)?;
+                        processor.send_frame(f)?;
                     },
                     Some(Ok(_)) => {},
                     Some(Err(e)) => {
