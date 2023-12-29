@@ -22,7 +22,7 @@ bytes = "1.0.1"
 futures = "0.3.14"
 h264-reader = "0.6.0"
 hex = "0.4.3"
-http-auth = "0.1.2"
+http-auth = { git = "https://github.com/scottlamb/http-auth", branch = "retina-issue-45-experiment" }
 log = "0.4.8"
 once_cell = "1.7.2"
 pin-project = "1.0.7"
