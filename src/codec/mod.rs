@@ -103,10 +103,15 @@ macro_rules! write_mpeg4_descriptor {
 
 pub(crate) mod aac;
 pub(crate) mod g723;
+mod h26x;
 pub(crate) mod jpeg;
 
 #[doc(hidden)]
 pub mod h264;
+
+#[cfg(feature = "unstable-h265")]
+#[doc(hidden)]
+pub mod h265;
 
 pub(crate) mod onvif;
 pub(crate) mod simple_audio;
@@ -240,6 +245,8 @@ impl std::fmt::Debug for VideoParameters {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 enum VideoCodec {
     H264,
+    #[cfg(feature = "unstable-h265")]
+    H265,
     Jpeg,
 }
 
@@ -248,6 +255,8 @@ impl VideoCodec {
     fn visual_sample_entry_box_type(self) -> [u8; 4] {
         match self {
             VideoCodec::H264 => *b"avc1",
+            #[cfg(feature = "unstable-h265")]
+            VideoCodec::H265 => *b"hvc1",
             VideoCodec::Jpeg => *b"mp4v",
         }
     }
@@ -307,6 +316,12 @@ impl VideoSampleEntryBuilder<'_> {
                 match self.params.codec {
                     VideoCodec::H264 => {
                         write_mp4_box!(&mut buf, *b"avcC", {
+                            buf.extend_from_slice(&self.params.extra_data);
+                        });
+                    }
+                    #[cfg(feature = "unstable-h265")]
+                    VideoCodec::H265 => {
+                        write_mp4_box!(&mut buf, *b"hvcC", {
                             buf.extend_from_slice(&self.params.extra_data);
                         });
                     }
@@ -629,6 +644,8 @@ enum DepacketizerInner {
     SimpleAudio(Box<simple_audio::Depacketizer>),
     G723(Box<g723::Depacketizer>),
     H264(Box<h264::Depacketizer>),
+    #[cfg(feature = "unstable-h265")]
+    H265(Box<h265::Depacketizer>),
     Onvif(Box<onvif::Depacketizer>),
     Jpeg(Box<jpeg::Depacketizer>),
 }
@@ -647,6 +664,11 @@ impl Depacketizer {
         // https://www.iana.org/assignments/rtp-parameters/rtp-parameters.xhtml#rtp-parameters-2
         Ok(Depacketizer(match (media, encoding_name) {
             ("video", "h264") => DepacketizerInner::H264(Box::new(h264::Depacketizer::new(
+                clock_rate,
+                format_specific_params,
+            )?)),
+            #[cfg(feature = "unstable-h265")]
+            ("video", "h265") => DepacketizerInner::H265(Box::new(h265::Depacketizer::new(
                 clock_rate,
                 format_specific_params,
             )?)),
@@ -721,6 +743,8 @@ impl Depacketizer {
             DepacketizerInner::Aac(d) => d.parameters(),
             DepacketizerInner::G723(d) => d.parameters(),
             DepacketizerInner::H264(d) => d.parameters(),
+            #[cfg(feature = "unstable-h265")]
+            DepacketizerInner::H265(d) => d.parameters(),
             DepacketizerInner::Onvif(d) => d.parameters(),
             DepacketizerInner::SimpleAudio(d) => d.parameters(),
             DepacketizerInner::Jpeg(d) => d.parameters(),
@@ -737,6 +761,8 @@ impl Depacketizer {
             DepacketizerInner::Aac(d) => d.push(input),
             DepacketizerInner::G723(d) => d.push(input),
             DepacketizerInner::H264(d) => d.push(input),
+            #[cfg(feature = "unstable-h265")]
+            DepacketizerInner::H265(d) => d.push(input),
             DepacketizerInner::Onvif(d) => d.push(input),
             DepacketizerInner::SimpleAudio(d) => d.push(input),
             DepacketizerInner::Jpeg(d) => d.push(input),
@@ -756,6 +782,8 @@ impl Depacketizer {
             DepacketizerInner::Aac(d) => d.pull(conn_ctx, stream_ctx),
             DepacketizerInner::G723(d) => Ok(d.pull()),
             DepacketizerInner::H264(d) => Ok(d.pull()),
+            #[cfg(feature = "unstable-h265")]
+            DepacketizerInner::H265(d) => Ok(d.pull()),
             DepacketizerInner::Onvif(d) => Ok(d.pull()),
             DepacketizerInner::SimpleAudio(d) => Ok(d.pull()),
             DepacketizerInner::Jpeg(d) => Ok(d.pull()),
@@ -784,6 +812,11 @@ mod tests {
             (
                 "h264::Depacketizer",
                 std::mem::size_of::<h264::Depacketizer>(),
+            ),
+            #[cfg(feature = "unstable-h265")]
+            (
+                "h265::Depacketizer",
+                std::mem::size_of::<h265::Depacketizer>(),
             ),
             (
                 "onvif::Depacketizer",

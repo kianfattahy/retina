@@ -1,7 +1,8 @@
 // Copyright (C) 2021 Scott Lamb <slamb@slamb.org>
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! [H.264](https://www.itu.int/rec/T-REC-H.264-201906-I/en)-encoded video.
+//! [H.264](https://www.itu.int/rec/T-REC-H.264-201906-I/en)-encoded video,
+//! with RTP encoding as in [RFC 6184](https://tools.ietf.org/html/rfc6184).
 
 use std::convert::TryFrom;
 use std::fmt::Write;
@@ -12,6 +13,7 @@ use h264_reader::nal::{NalHeader, UnitType};
 use log::{debug, log_enabled, trace};
 
 use crate::{
+    codec::h26x::TolerantBitReader,
     rtp::{ReceivedPacket, ReceivedPacketBuilder},
     Error, Timestamp,
 };
@@ -22,9 +24,12 @@ use super::VideoFrame;
 /// and produces unfragmented NAL units as specified in [RFC
 /// 6184](https://tools.ietf.org/html/rfc6184).
 ///
-/// This doesn't inspect the contents of the NAL units, so it doesn't depend on or
-/// verify compliance with H.264 section 7.4.1.2.3 "Order of NAL units and coded
-/// pictures and association to access units".
+/// This inspects the contents of the NAL units only minimally, and largely for
+/// logging. In particular, it doesn't completely enforce verify compliance with H.264
+/// section 7.4.1.2.3 "Order of NAL units and coded pictures and association to
+/// access units". For compatibility with some broken cameras that change
+/// timestamps mid-AU, it does extend AUs if they end with parameter sets.
+/// See `can_end_au`.
 ///
 /// Currently expects that the stream starts at an access unit boundary unless
 /// packet loss is indicated.
@@ -229,11 +234,10 @@ impl Depacketizer {
             return Err("Empty NAL".into());
         }
         // https://tools.ietf.org/html/rfc6184#section-5.2
-        let nal_header = data[0];
+        let nal_header = data.get_u8();
         if (nal_header >> 7) != 0 {
             return Err(format!("NAL header {nal_header:02x} has F bit set"));
         }
-        data.advance(1); // skip the header byte.
         match nal_header & 0b11111 {
             1..=23 => {
                 if access_unit.in_fu_a {
@@ -241,7 +245,7 @@ impl Depacketizer {
                         "Non-fragmented NAL {nal_header:02x} while fragment in progress"
                     ));
                 }
-                let len = u32::try_from(data.len()).expect("data len < u16::MAX") + 1;
+                let len = u32::try_from(data.len()).expect("data len should be <= u16::MAX") + 1;
                 let next_piece_idx = self.add_piece(data)?;
                 self.nals.push(Nal {
                     hdr: NalHeader::new(nal_header).expect("header w/o F bit set is valid"),
@@ -305,14 +309,13 @@ impl Depacketizer {
                 if data.len() < 2 {
                     return Err(format!("FU-A len {} too short", data.len()));
                 }
-                let fu_header = data[0];
+                let fu_header = data.get_u8();
                 let start = (fu_header & 0b10000000) != 0;
                 let end = (fu_header & 0b01000000) != 0;
                 let reserved = (fu_header & 0b00100000) != 0;
                 let nal_header =
                     NalHeader::new((nal_header & 0b011100000) | (fu_header & 0b00011111))
                         .expect("NalHeader is valid");
-                data.advance(1);
                 if (start && end) || reserved {
                     return Err(format!("Invalid FU-A header {fu_header:02x}"));
                 }
@@ -362,7 +365,7 @@ impl Depacketizer {
                     }
                 }
             }
-            _ => return Err(format!("bad nal header {nal_header:02x}")),
+            _ => return Err(format!("unexpected/bad nal header {nal_header:02x}")),
         }
         self.input_state = if mark {
             let last_nal_hdr = self.nals.last().unwrap().hdr;
@@ -429,7 +432,7 @@ impl Depacketizer {
     fn finalize_access_unit(&mut self, au: AccessUnit, reason: &str) -> Result<VideoFrame, String> {
         let mut piece_idx = 0;
         let mut retained_len = 0usize;
-        let mut is_random_access_point = false;
+        let mut is_random_access_point = true;
         let mut is_disposable = true;
         let mut new_sps = None;
         let mut new_pps = None;
@@ -461,7 +464,10 @@ impl Depacketizer {
                         new_pps = Some(to_bytes(nal.hdr, nal.len, nal_pieces));
                     }
                 }
-                UnitType::SliceLayerWithoutPartitioningIdr => is_random_access_point = true,
+                UnitType::SliceDataPartitionALayer
+                | UnitType::SliceDataPartitionBLayer
+                | UnitType::SliceDataPartitionCLayer
+                | UnitType::SliceLayerWithoutPartitioningNonIdr => is_random_access_point = false,
                 _ => {}
             }
             if nal.hdr.nal_ref_idc() != 0 {
@@ -625,84 +631,6 @@ struct InternalParameters {
     pps_nal: Bytes,
 
     seen_extra_trailing_data: bool,
-}
-
-/// `h264_reader::rbsp::BitRead` impl that *notes* extra trailing data rather than failing on it.
-///
-/// Some (Reolink) cameras appear to have a stray extra byte at the end. Follow the lead of most
-/// other RTSP implementations in tolerating this.
-#[derive(Debug)]
-struct TolerantBitReader<'a, R> {
-    inner: R,
-    has_extra_trailing_data: &'a mut bool,
-}
-
-impl<'a, R: h264_reader::rbsp::BitRead> h264_reader::rbsp::BitRead for TolerantBitReader<'a, R> {
-    fn read_ue(&mut self, name: &'static str) -> Result<u32, h264_reader::rbsp::BitReaderError> {
-        self.inner.read_ue(name)
-    }
-
-    fn read_se(&mut self, name: &'static str) -> Result<i32, h264_reader::rbsp::BitReaderError> {
-        self.inner.read_se(name)
-    }
-
-    fn read_bool(&mut self, name: &'static str) -> Result<bool, h264_reader::rbsp::BitReaderError> {
-        self.inner.read_bool(name)
-    }
-
-    fn read_u8(
-        &mut self,
-        bit_count: u32,
-        name: &'static str,
-    ) -> Result<u8, h264_reader::rbsp::BitReaderError> {
-        self.inner.read_u8(bit_count, name)
-    }
-
-    fn read_u16(
-        &mut self,
-        bit_count: u32,
-        name: &'static str,
-    ) -> Result<u16, h264_reader::rbsp::BitReaderError> {
-        self.inner.read_u16(bit_count, name)
-    }
-
-    fn read_u32(
-        &mut self,
-        bit_count: u32,
-        name: &'static str,
-    ) -> Result<u32, h264_reader::rbsp::BitReaderError> {
-        self.inner.read_u32(bit_count, name)
-    }
-
-    fn read_i32(
-        &mut self,
-        bit_count: u32,
-        name: &'static str,
-    ) -> Result<i32, h264_reader::rbsp::BitReaderError> {
-        self.inner.read_i32(bit_count, name)
-    }
-
-    fn has_more_rbsp_data(
-        &mut self,
-        name: &'static str,
-    ) -> Result<bool, h264_reader::rbsp::BitReaderError> {
-        self.inner.has_more_rbsp_data(name)
-    }
-
-    fn finish_rbsp(self) -> Result<(), h264_reader::rbsp::BitReaderError> {
-        match self.inner.finish_rbsp() {
-            Ok(()) => Ok(()),
-            Err(h264_reader::rbsp::BitReaderError::RemainingData) => {
-                *self.has_extra_trailing_data = true;
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
-    }
-
-    fn finish_sei_payload(self) -> Result<(), h264_reader::rbsp::BitReaderError> {
-        self.inner.finish_sei_payload()
-    }
 }
 
 impl InternalParameters {
@@ -872,7 +800,7 @@ impl InternalParameters {
 
 /// Returns true iff the bytes of `nal` equal the bytes of `[hdr, ..data]`.
 fn nal_matches(nal: &[u8], hdr: NalHeader, pieces: &[Bytes]) -> bool {
-    if nal.is_empty() || nal[0] != u8::from(hdr) {
+    if nal.first() != Some(&u8::from(hdr)) {
         return false;
     }
     let mut nal_pos = 1;
@@ -889,7 +817,7 @@ fn nal_matches(nal: &[u8], hdr: NalHeader, pieces: &[Bytes]) -> bool {
     nal_pos == nal.len()
 }
 
-/// Saves the given NAL to a contiguous Bytes.
+/// Saves the given NAL to a contiguous `Bytes``.
 fn to_bytes(hdr: NalHeader, len: u32, pieces: &[Bytes]) -> Bytes {
     let len = usize::try_from(len).expect("u32 fits in usize");
     let mut out = Vec::with_capacity(len);
@@ -1114,7 +1042,7 @@ enum PacketizerState {
 mod tests {
     use std::num::NonZeroU32;
 
-    use crate::testutil::init_logging;
+    use crate::testutil::{assert_eq_hex, init_logging};
     use crate::{codec::CodecItem, rtp::ReceivedPacketBuilder};
 
     /*
@@ -1166,7 +1094,7 @@ mod tests {
                     }
                 }
             }
-            assert_eq!(frame.unwrap().data(), &sample.bytes);
+            assert_eq_hex!(frame.unwrap().data(), &sample.bytes);
         }
     }
      */
@@ -1268,7 +1196,7 @@ mod tests {
             Some(CodecItem::VideoFrame(frame)) => frame,
             _ => panic!(),
         };
-        assert_eq!(
+        assert_eq_hex!(
             frame.data(),
             b"\x00\x00\x00\x06\x06plain\
                      \x00\x00\x00\x09\x06stap-a 1\
@@ -1352,7 +1280,7 @@ mod tests {
             Some(CodecItem::VideoFrame(frame)) => frame,
             o => panic!("unexpected pull result {o:#?}"),
         };
-        assert_eq!(
+        assert_eq_hex!(
             frame.data(),
             b"\x00\x00\x00\x0C\x67\x64\x00\x33\xac\x15\x14\xa0\xa0\x2f\xf9\x50\
               \x00\x00\x00\x04\x68\xee\x3c\xb0\
@@ -1399,7 +1327,7 @@ mod tests {
             Some(CodecItem::VideoFrame(frame)) => frame,
             o => panic!("unexpected pull result {o:#?}"),
         };
-        assert_eq!(frame.data(), b"\x00\x00\x00\x06\x01slice");
+        assert_eq_hex!(frame.data(), b"\x00\x00\x00\x06\x01slice");
         assert_eq!(frame.timestamp, ts1);
         d.push(
             ReceivedPacketBuilder {
@@ -1455,7 +1383,7 @@ mod tests {
             Some(CodecItem::VideoFrame(frame)) => frame,
             o => panic!("unexpected pull result {o:#?}"),
         };
-        assert_eq!(
+        assert_eq_hex!(
             frame.data(),
             b"\x00\x00\x00\x0C\x67\x64\x00\x33\xac\x15\x14\xa0\xa0\x2f\xf9\x50\
               \x00\x00\x00\x04\x68\xee\x3c\xb0\

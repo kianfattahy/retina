@@ -13,10 +13,11 @@ categories = ["network-programming", "multimedia"]
 description = "high-level RTSP multimedia streaming library"
 repository = "https://github.com/scottlamb/retina"
 include = ["src/**/*", "benches", "Cargo.toml"]
-rust-version = "1.67"
+rust-version = "1.79"
 
 [features]
 unstable-sample-entry = []
+unstable-h265 = []
 
 [package.metadata.docs.rs]
 # https://docs.rs/about/metadata
@@ -29,7 +30,9 @@ base64 = "0.21.0"
 bitstream-io = "1.1"
 bytes = "1.0.1"
 futures = "0.3.14"
-h264-reader = "0.7.0"
+#h264-reader = "0.7.0"
+#h264-reader = { path = "../../crates/h264-reader" }
+h264-reader = { git = "https://github.com/scottlamb/h264-reader", rev = "35968d5ca67f317fd35c1e344adb8ae14ee2efd6" }
 hex = "0.4.3"
 http-auth = "0.1.2"
 log = "0.4.8"
