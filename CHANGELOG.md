@@ -1,3 +1,8 @@
+## unreleased
+
+*   update minimum Rust to 1.70.
+*   use [`jiff`](https://crates.io/crates/jiff) for date formatting.
+
 ## `v0.4.9` (2024-08-19)
 
 *   added helpers for building `.mp4` `VisualSampleEntry` and `AudioSampleEntry`
