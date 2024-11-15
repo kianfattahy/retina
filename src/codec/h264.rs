@@ -476,7 +476,7 @@ impl Depacketizer {
         for nal in &self.nals {
             let next_piece_idx = usize::try_from(nal.next_piece_idx).expect("u32 fits in usize");
             let nal_pieces = &self.pieces[piece_idx..next_piece_idx];
-            data.extend_from_slice(&nal.len.to_be_bytes()[..]);
+            data.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]); // Append the Annex B start code
             data.push(nal.hdr.into());
             let mut actual_len = 1;
             for piece in nal_pieces {
